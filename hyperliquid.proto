@@ -1,0 +1,38 @@
+// Version 1
+syntax = "proto3";
+
+package hyperliquid_l1_gateway.v1;
+option go_package = "internal/api";
+
+service HyperLiquidL1Gateway {
+  // Get single OrderBookSnapshot at timestamp
+  rpc GetOrderBookSnapshot(Timestamp) returns (OrderBookSnapshot) {}
+
+  // Stream Blocks starting from timestamp
+  rpc StreamBlocks(Timestamp) returns (stream Block) {}
+
+  // Stream OrderBookSnapshots starting from timestamp
+  rpc StreamOrderBookSnapshots(Timestamp) returns (stream OrderBookSnapshot) {}
+
+  // Stream BlockFills starting from timestamp
+  rpc StreamBlockFills(Timestamp) returns (stream BlockFills) {};
+}
+
+message Timestamp {   
+  int64 timestamp = 1;
+} 
+
+message Block {
+  // JSON-encoded object conforming to files of HyperLiquid data dir "replica_cmds"
+  bytes data = 1;
+}
+
+message OrderBookSnapshot {
+  // JSON-encoded object conforming to a HyperLiquid order book snapshot
+  bytes data = 1;
+}
+
+message BlockFills {
+  // JSON-encoded object conforming to files of HyperLiquid data dir "node_fills"
+  bytes data = 1;
+}

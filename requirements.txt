@@ -1,0 +1,8 @@
+# Core dependencies for the copy trading bot
+python-dotenv>=1.0.0   # For loading .env configuration
+grpcio>=1.60.0         # For gRPC streaming
+grpcio-tools>=1.60.0   # For protobuf support
+
+# For live trading
+hyperliquid-python-sdk>=0.19.0  # Hyperliquid exchange integration
+eth-account>=0.8.0     # For Ethereum account management
