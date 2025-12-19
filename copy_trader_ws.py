@@ -68,11 +68,26 @@ class CopyTradingBot:
         self.safety_flatten_after_sec = float(safety_flatten) if safety_flatten else None
         self.disconnect_start_time = None
 
+        # ---- Coalescing ----
+        self.coalesce_window_ms = int(os.getenv("COALESCE_WINDOW_MS", "100"))
+        self._coalesce_buf = {}  # key -> {sum_sz, sum_px_sz, max_time, first_ms, last_ms, template_fill}
+        self._agg_counter = 0
+
+        # ---- Option B: periodic flusher thread (NEW) ----
+        self.coalesce_flush_interval_ms = int(os.getenv("COALESCE_FLUSH_INTERVAL_MS", "25"))
+        self.coalesce_lock = threading.Lock()  # protect _coalesce_buf (NEW)
+        self.coalesce_flusher_thread = None     # (NEW)
+
         # === State Tracking ===
-        self.processed_fills = set()      # Avoid duplicate fills (TARGET only)
+        self.processed_fills = set()      # Avoid duplicate fills (TARGET only; includes aggregated ids)
         self.open_positions = {}          # {coin: net size} - positive=long, negative=short (OUR ACCOUNT)
         self.coin_metadata = {}           # Cached size precision per coin
         self.target_positions = {}        # {coin: net size} - target trader reconstructed from fills
+
+        # ---- Pending closes + sync-on-miss rate limit ----
+        self.pending_closes = {}          # {coin: [ {frac, price, dir, ts_ms}, ... ]}
+        self.last_sync_ts = {}            # {coin: last_sync_time_sec}
+        self.sync_on_miss_cooldown_sec = float(os.getenv("SYNC_ON_MISS_COOLDOWN_SEC", "0.5"))
 
         # === Async pipeline (avoid blocking WS receiver on order execution) ===
         self.state_lock = threading.Lock()
@@ -122,7 +137,8 @@ class CopyTradingBot:
             print("🧩 Coin filter: ALL")
         print(f"📌 Max open positions: {self.max_open_positions}")
         print(f"📉 Slippage tolerance: {self.slippage_tolerance_pct}%")
-        print(f"⛔ Min notional per order: ${self.min_notional_usd:.2f}\n")
+        print(f"⛔ Min notional per order: ${self.min_notional_usd:.2f}")
+        print(f"🧮 Coalesce window: {self.coalesce_window_ms}ms\n")
 
         # Cache metadata
         try:
@@ -146,6 +162,15 @@ class CopyTradingBot:
         self.exec_pool = ThreadPoolExecutor(max_workers=max(1, self.order_workers))
         self.dispatcher_thread = threading.Thread(target=self._dispatcher_loop, name="fill-dispatcher", daemon=True)
         self.dispatcher_thread.start()
+
+        # ---- Option B: start periodic flusher (NEW) ----
+        if self.coalesce_flusher_thread is None:
+            self.coalesce_flusher_thread = threading.Thread(
+                target=self._coalesce_flusher_loop,
+                name="coalesce-flusher",
+                daemon=True
+            )
+            self.coalesce_flusher_thread.start()
 
     def _stop_async_pipeline(self):
         self.stop_event.set()
@@ -185,6 +210,114 @@ class CopyTradingBot:
                     pass
 
     # ------------------------
+    # Coalescing
+    # ------------------------
+    def _coalesce_key(self, fill: dict):
+        coin = fill.get("coin", "")
+        side = fill.get("side", "")
+        direction = fill.get("dir", "") or ""
+        closed_pnl = fill.get("closedPnl", "0")
+        is_closing = direction.startswith("Close") if direction else (closed_pnl and float(closed_pnl) != 0)
+        return (coin, side, direction, bool(is_closing))
+
+    def _coalesce_add_fill(self, fill: dict):
+        """
+        Add one TARGET fill to coalescing buffer. Flushes any buckets older than window.
+        """
+        now_ms = int(time.time() * 1000)
+        key = self._coalesce_key(fill)
+
+        try:
+            sz = float(fill.get("sz", 0))
+        except Exception:
+            sz = 0.0
+        try:
+            px = float(fill.get("px", 0))
+        except Exception:
+            px = 0.0
+        try:
+            t_ms = int(float(fill.get("time", now_ms)))
+        except Exception:
+            t_ms = now_ms
+
+        if sz <= 0 or px <= 0:
+            return
+
+        with self.coalesce_lock:  # (NEW)
+            b = self._coalesce_buf.get(key)
+            if b is None:
+                self._coalesce_buf[key] = {
+                    "sum_sz": sz,
+                    "sum_px_sz": sz * px,
+                    "max_time": t_ms,
+                    "first_ms": now_ms,
+                    "last_ms": now_ms,
+                    "template": dict(fill),
+                }
+            else:
+                b["sum_sz"] += sz
+                b["sum_px_sz"] += sz * px
+                if t_ms > b["max_time"]:
+                    b["max_time"] = t_ms
+                b["last_ms"] = now_ms
+
+        self._coalesce_flush_due(now_ms)
+
+    def _coalesce_flush_due(self, now_ms: int):
+        with self.coalesce_lock:  # (NEW)
+            if not self._coalesce_buf:
+                return
+            win = self.coalesce_window_ms
+            to_flush = []
+            for k, b in self._coalesce_buf.items():
+                if (now_ms - b["last_ms"]) >= win:
+                    to_flush.append(k)
+
+            for k in to_flush:
+                b = self._coalesce_buf.pop(k, None)
+                if not b:
+                    continue
+                self._enqueue_aggregated_bucket(k, b)
+
+    def _coalesce_flush_all(self):
+        with self.coalesce_lock:  # (NEW)
+            if not self._coalesce_buf:
+                return
+            for k, b in list(self._coalesce_buf.items()):
+                self._coalesce_buf.pop(k, None)
+                self._enqueue_aggregated_bucket(k, b)
+
+    def _enqueue_aggregated_bucket(self, key, bucket):
+        sum_sz = bucket.get("sum_sz", 0.0)
+        sum_px_sz = bucket.get("sum_px_sz", 0.0)
+        if sum_sz <= 0 or sum_px_sz <= 0:
+            return
+        vwap = sum_px_sz / sum_sz
+
+        tmpl = bucket.get("template", {})
+        agg = dict(tmpl)
+        agg["sz"] = str(sum_sz)
+        agg["px"] = str(vwap)
+        agg["time"] = bucket.get("max_time", tmpl.get("time"))
+        # ---- propagate WS receive timestamp for ws_recv_lag ----
+        agg["_recv_ms"] = bucket.get("last_ms")
+        # create a unique id for bot-side dedupe
+        self._agg_counter += 1
+        agg["_agg_id"] = f"agg_{int(time.time()*1000)}_{self._agg_counter}"
+        self._enqueue_fill(agg)
+
+    # ---- Option B: periodic flusher loop (NEW) ----
+    def _coalesce_flusher_loop(self):
+        interval = max(1, int(self.coalesce_flush_interval_ms))
+        while not self.stop_event.is_set():
+            try:
+                now_ms = int(time.time() * 1000)
+                self._coalesce_flush_due(now_ms)
+            except Exception:
+                pass
+            time.sleep(interval / 1000.0)
+
+    # ------------------------
     # Metadata / rounding
     # ------------------------
     def _fetch_coin_metadata(self):
@@ -204,10 +337,6 @@ class CopyTradingBot:
         return float(q)
 
     def _round_price_aggressive(self, coin, price, is_buy):
-        """
-        Hyperliquid enforces a 5 significant-figures max price rule.
-        Round aggressively to satisfy the rule.
-        """
         if price <= 0:
             return price
 
@@ -234,12 +363,15 @@ class CopyTradingBot:
     # ------------------------
     # Position tracking (OUR side from WS)
     # ------------------------
+    def _trigger_pending_close_processing(self, coin: str):
+        if self.exec_pool is None:
+            return
+        try:
+            self.exec_pool.submit(self._process_pending_closes_for_coin, coin)
+        except Exception:
+            pass
+
     def _apply_our_fill_to_positions(self, fill: dict):
-        """
-        Update OUR open_positions from OUR fills stream.
-        Robust method: net position delta = +sz on BUY, -sz on SELL.
-        Works for both opening and closing because it's net.
-        """
         coin = fill.get("coin", "")
         side = fill.get("side", "")
         sz = fill.get("sz", None)
@@ -259,6 +391,12 @@ class CopyTradingBot:
                     del self.open_positions[coin]
             else:
                 self.open_positions[coin] = new
+
+            has_pending = bool(self.pending_closes.get(coin))
+            has_pos = (coin in self.open_positions)
+
+        if has_pending and has_pos:
+            self._trigger_pending_close_processing(coin)
 
     # ------------------------
     # Exchange sync (fallback / debug)
@@ -297,11 +435,56 @@ class CopyTradingBot:
             if verbose:
                 print(f"   ⚠️  Sync failed: {e}\n")
 
+    def _sync_on_miss_for_coin(self, coin: str):
+        if self.dry_run or self.info is None:
+            return
+
+        now = time.time()
+        with self.state_lock:
+            last = self.last_sync_ts.get(coin, 0.0)
+            if (now - last) < self.sync_on_miss_cooldown_sec:
+                return
+            self.last_sync_ts[coin] = now
+
+        self._sync_positions_from_exchange(verbose=False)
+
+    # ------------------------
+    # Pending close processing
+    # ------------------------
+    def _process_pending_closes_for_coin(self, coin: str):
+        while True:
+            with self.state_lock:
+                pend = self.pending_closes.get(coin, [])
+                if not pend:
+                    return
+                if coin not in self.open_positions:
+                    return
+                our_pos = float(self.open_positions.get(coin, 0.0))
+                item = pend.pop(0)
+                if pend:
+                    self.pending_closes[coin] = pend
+                else:
+                    self.pending_closes.pop(coin, None)
+
+            frac = float(item.get("frac", 1.0))
+            price = item.get("price", "0")
+            close_side = 'A' if our_pos > 0 else 'B'
+            our_close_sz = self._round_size(coin, abs(our_pos) * frac)
+            if our_close_sz <= 0:
+                continue
+
+            print(f"\n   🧩 Pending CLOSE triggered for {coin}: frac={frac:.4f}, close_sz={our_close_sz}")
+            self.place_order(coin, close_side, our_close_sz, price, is_closing=True)
+
     # ------------------------
     # Signals / shutdown
     # ------------------------
     def _signal_handler(self, sig, frame):
         print("\n\n🛑 Shutting down...")
+        try:
+            self._coalesce_flush_all()
+        except Exception:
+            pass
         self._stop_async_pipeline()
         print(f"📊 Processed {len(self.processed_fills)} unique target fills")
         if self.dropped_fills:
@@ -365,11 +548,6 @@ class CopyTradingBot:
     # Order placement
     # ------------------------
     def place_order(self, coin, side, size, price, is_closing=False):
-        """
-        Place order on Hyperliquid (or simulate in dry-run mode)
-        Uses IOC orders (aggressive limit).
-        Important: OUR open_positions are updated from OUR WS fills, not from this response.
-        """
         is_buy = (side == 'B')
         side_name = 'BUY' if is_buy else 'SELL'
         action = 'CLOSE' if is_closing else 'OPEN'
@@ -379,13 +557,11 @@ class CopyTradingBot:
 
         if self.dry_run:
             print("   🔵 DRY RUN (set DRY_RUN=false to enable real trading)\n")
-            # In dry-run, simulate net update immediately
             fake_fill = {"coin": coin, "side": side, "sz": float(size)}
             self._apply_our_fill_to_positions(fake_fill)
             return
 
         if is_closing:
-            # Optional safety check: sync exchange to ensure we have a position
             self._sync_positions_from_exchange(verbose=False)
             with self.state_lock:
                 _has_pos = coin in self.open_positions
@@ -400,7 +576,6 @@ class CopyTradingBot:
         try:
             order_price = float(price)
 
-            # slippage
             if self.slippage_tolerance_pct > 0:
                 if is_buy:
                     order_price = order_price * (1 + self.slippage_tolerance_pct / 100.0)
@@ -429,21 +604,16 @@ class CopyTradingBot:
                 print(f"      ❌ Order API failed: {resp}")
                 return
 
-            # Correct / robust parsing: response.data.statuses with filled/resting/error
             data = resp.get("data", {}) if isinstance(resp, dict) else {}
             statuses = data.get("statuses", []) if isinstance(data, dict) else []
 
-            # Print a concise summary
             if isinstance(statuses, list) and statuses:
                 for st in statuses:
                     if not isinstance(st, dict):
                         continue
                     if "filled" in st:
                         f = st.get("filled", {})
-                        try:
-                            print(f"      ✅ Order status: filled totalSz={f.get('totalSz')} avgPx={f.get('avgPx')} oid={f.get('oid')}")
-                        except Exception:
-                            print("      ✅ Order status: filled")
+                        print(f"      ✅ Order status: filled totalSz={f.get('totalSz')} avgPx={f.get('avgPx')} oid={f.get('oid')}")
                     elif "resting" in st:
                         r = st.get("resting", {})
                         print(f"      🟡 Order status: resting oid={r.get('oid')}")
@@ -452,7 +622,6 @@ class CopyTradingBot:
                     else:
                         print(f"      ℹ️ Order status: {st}")
             else:
-                # No detailed status; that's OK: OUR WS fills will confirm execution.
                 print("      ℹ️ Order accepted (no detailed status). Waiting for our WS fills to confirm execution.")
 
         except Exception as e:
@@ -465,7 +634,12 @@ class CopyTradingBot:
         if wallet_address.lower() != self.target_wallet:
             return
 
-        fill_id = f"{fill_data.get('hash', '')}_{fill_data.get('tid', '')}"
+        agg_id = fill_data.get("_agg_id")
+        if agg_id:
+            fill_id = str(agg_id)
+        else:
+            fill_id = f"{fill_data.get('hash', '')}_{fill_data.get('tid', '')}"
+
         with self.state_lock:
             if fill_id in self.processed_fills:
                 return
@@ -507,6 +681,15 @@ class CopyTradingBot:
         if fill_time_ms is not None:
             exchange_lag_ms = max(0, now_ms - fill_time_ms)
 
+        # ---- WS receive lag ----
+        ws_recv_ms = fill_data.get("_recv_ms", None)
+        ws_recv_lag_ms = None
+        if fill_time_ms is not None and ws_recv_ms is not None:
+            try:
+                ws_recv_lag_ms = max(0, int(ws_recv_ms) - fill_time_ms)
+            except Exception:
+                ws_recv_lag_ms = None
+
         enq_ms = fill_data.get("_enq_ms", None)
         queue_lag_ms = None
         if enq_ms is not None:
@@ -536,6 +719,8 @@ class CopyTradingBot:
         lag_parts = []
         if exchange_lag_ms is not None:
             lag_parts.append(f"exchange_lag={exchange_lag_ms}ms")
+        if ws_recv_lag_ms is not None:
+            lag_parts.append(f"ws_recv_lag={ws_recv_lag_ms}ms")
         if queue_lag_ms is not None:
             lag_parts.append(f"queue_lag={queue_lag_ms}ms")
         lag_parts.append(f"queue_size={qsize}")
@@ -546,19 +731,36 @@ class CopyTradingBot:
         # ===== CLOSE logic =====
         if is_closing:
             with self.state_lock:
-                _has_pos = coin in self.open_positions
-                our_pos = self.open_positions.get(coin, 0.0)
-
-            if not _has_pos:
-                print(f"   ⏭️  SKIP: No {coin} position (bot may have started after open)")
-                print("=" * 70)
-                self._update_target_position(coin, size, direction)
-                return
-
-            with self.state_lock:
                 prev_target_pos = self.target_positions.get(coin, 0.0)
+
             target_close_sz = float(size)
             frac = (target_close_sz / abs(prev_target_pos)) if abs(prev_target_pos) > 0 else 1.0
+
+            with self.state_lock:
+                has_pos = (coin in self.open_positions)
+                our_pos = float(self.open_positions.get(coin, 0.0))
+
+            if not has_pos:
+                self._sync_on_miss_for_coin(coin)
+
+                with self.state_lock:
+                    has_pos2 = (coin in self.open_positions)
+                    our_pos2 = float(self.open_positions.get(coin, 0.0))
+
+                if not has_pos2:
+                    with self.state_lock:
+                        self.pending_closes.setdefault(coin, []).append({
+                            "frac": frac,
+                            "price": price,
+                            "dir": direction,
+                            "ts_ms": fill_time_ms,
+                        })
+                    print(f"   ⏳ PENDING: No {coin} position yet; queued CLOSE (frac={frac:.4f}) to retry after our fills arrive")
+                    print("=" * 70)
+                    self._update_target_position(coin, size, direction)
+                    return
+
+                our_pos = our_pos2
 
             our_close_sz = self._round_size(coin, abs(our_pos) * frac)
             if our_close_sz <= 0:
@@ -648,13 +850,6 @@ class CopyTradingBot:
     # WS stream: target fills + our account events
     # ------------------------
     def stream_ws(self):
-        """
-        One WS connection, multiple subscriptions:
-          - userFills for TARGET (to copy)
-          - userFills for OUR wallet (to update open_positions from truth)
-          - userEvents + orderUpdates for OUR wallet (optional extra visibility)
-        Subscription format matches Hyperliquid docs. :contentReference[oaicite:2]{index=2}
-        """
         ws_url = os.getenv("HYPERLIQUID_WS_URL", "").strip() or "wss://api.hyperliquid.xyz/ws"
 
         while not self.stop_event.is_set():
@@ -662,13 +857,11 @@ class CopyTradingBot:
                 print("🔌 Connecting to Hyperliquid WebSocket stream...")
                 ws = websocket.create_connection(ws_url, timeout=30)
 
-                # Subscribe: TARGET userFills
                 ws.send(json.dumps({
                     "method": "subscribe",
                     "subscription": {"type": "userFills", "user": self.target_wallet}
                 }))
 
-                # Subscribe: OUR wallet streams (if known)
                 if self.our_wallet:
                     ws.send(json.dumps({
                         "method": "subscribe",
@@ -692,7 +885,10 @@ class CopyTradingBot:
                         ws.settimeout(30)
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
-                        # keepalive
+                        try:
+                            self._coalesce_flush_due(int(time.time() * 1000))
+                        except Exception:
+                            pass
                         try:
                             ws.send(json.dumps({"method": "ping"}))
                         except Exception:
@@ -710,11 +906,9 @@ class CopyTradingBot:
                     channel = msg.get("channel", "")
                     data = msg.get("data", None)
 
-                    # Ignore acks / pong
                     if channel in ("subscriptionResponse", "pong"):
                         continue
 
-                    # --- userFills ---
                     if channel == "userFills" and isinstance(data, dict):
                         if data.get("isSnapshot", False):
                             continue
@@ -723,14 +917,15 @@ class CopyTradingBot:
                         if not isinstance(fills, list):
                             continue
 
-                        # TARGET fills => enqueue for async processing
                         if user == self.target_wallet:
+                            # stamp WS receive time on each fill
+                            recv_ms = int(time.time() * 1000)
                             for fill in fills:
                                 if isinstance(fill, dict):
-                                    self._enqueue_fill(fill)
+                                    fill["_recv_ms"] = recv_ms
+                                    self._coalesce_add_fill(fill)
                             continue
 
-                        # OUR fills => update OUR positions (fast, non-blocking)
                         if self.our_wallet and user == self.our_wallet:
                             for fill in fills:
                                 if isinstance(fill, dict):
@@ -739,11 +934,9 @@ class CopyTradingBot:
 
                         continue
 
-                    # --- userEvents (OUR wallet) ---
                     if channel == "userEvents" and isinstance(data, dict):
                         user = (data.get("user") or "").lower()
                         if self.our_wallet and user == self.our_wallet:
-                            # If this payload contains fills, apply them too.
                             fills = data.get("fills", [])
                             if isinstance(fills, list):
                                 for fill in fills:
@@ -751,14 +944,16 @@ class CopyTradingBot:
                                         self._apply_our_fill_to_positions(fill)
                         continue
 
-                    # --- orderUpdates (OUR wallet) ---
                     if channel == "orderUpdates" and isinstance(data, dict):
-                        # We don't need it for open_positions (fills are enough),
-                        # but we keep the subscription for visibility/future improvements.
                         continue
 
             except Exception as e:
                 print(f"❌ WebSocket error: {e}")
+
+                try:
+                    self._coalesce_flush_all()
+                except Exception:
+                    pass
 
                 if self.disconnect_start_time is None:
                     self.disconnect_start_time = time.time()
