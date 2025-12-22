@@ -36,7 +36,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Hyperliquid Copy Trading Bot")
+        print("\n🤖 Hyperliquid Copy Trading Bot v2.7")
 
         load_dotenv()
 
