@@ -17,6 +17,7 @@ import math
 import time
 import datetime
 import threading
+import hashlib
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -36,7 +37,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Hyperliquid Copy Trading Bot v2.7")
+        print("\n🤖 Hyperliquid Copy Trading Bot v2.8")
 
         load_dotenv()
 
@@ -80,6 +81,7 @@ class CopyTradingBot:
 
         # === State Tracking ===
         self.processed_fills = set()      # Avoid duplicate fills (TARGET only; includes aggregated ids)
+        self.raw_target_seen = set()     # Raw target fill ids seen (pre-coalesce) to avoid double-counting
         self.open_positions = {}          # {coin: net size} - positive=long, negative=short (OUR ACCOUNT)
         self.coin_metadata = {}           # Cached size precision per coin
         self.target_positions = {}        # {coin: net size} - target trader reconstructed from fills
@@ -212,6 +214,21 @@ class CopyTradingBot:
     # ------------------------
     # Coalescing
     # ------------------------
+    def _raw_target_fill_id(self, fill: dict) -> str:
+        """Best-effort stable id for a raw TARGET fill (used for pre-coalesce dedup)."""
+        h = fill.get("hash", "")
+        tid = fill.get("tid", "")
+        if h or tid:
+            return f"{h}_{tid}"
+        # Fallback (rare): build a deterministic key from fields that usually identify a fill
+        coin = fill.get("coin", "")
+        side = fill.get("side", "")
+        t = fill.get("time", "")
+        px = fill.get("px", "")
+        sz = fill.get("sz", "")
+        dir_ = fill.get("dir", "")
+        return f"fb_{coin}_{side}_{dir_}_{t}_{px}_{sz}"
+
     def _coalesce_key(self, fill: dict):
         coin = fill.get("coin", "")
         side = fill.get("side", "")
@@ -253,6 +270,8 @@ class CopyTradingBot:
                     "first_ms": now_ms,
                     "last_ms": now_ms,
                     "template": dict(fill),
+                    "count": 1,
+                    "ids": [self._raw_target_fill_id(fill)],
                 }
             else:
                 b["sum_sz"] += sz
@@ -260,6 +279,11 @@ class CopyTradingBot:
                 if t_ms > b["max_time"]:
                     b["max_time"] = t_ms
                 b["last_ms"] = now_ms
+                b["count"] = int(b.get("count", 1)) + 1
+                try:
+                    b.setdefault("ids", []).append(self._raw_target_fill_id(fill))
+                except Exception:
+                    pass
 
         self._coalesce_flush_due(now_ms)
 
@@ -301,9 +325,16 @@ class CopyTradingBot:
         agg["time"] = bucket.get("max_time", tmpl.get("time"))
         # ---- propagate WS receive timestamp for ws_recv_lag ----
         agg["_recv_ms"] = bucket.get("last_ms")
-        # create a unique id for bot-side dedupe
+        # create a deterministic id for bot-side dedupe (stable across reconnect duplicates)
+        ids = bucket.get("ids") or []
+        try:
+            ids_str = "|".join(sorted(str(x) for x in ids))
+            digest = hashlib.sha1(ids_str.encode("utf-8")).hexdigest()[:16] if ids_str else ""
+        except Exception:
+            digest = ""
         self._agg_counter += 1
-        agg["_agg_id"] = f"agg_{int(time.time()*1000)}_{self._agg_counter}"
+        agg["_agg_n"] = int(bucket.get("count", 1))
+        agg["_agg_id"] = f"agg_{digest}_{self._agg_counter}" if digest else f"agg_{int(time.time()*1000)}_{self._agg_counter}"
         self._enqueue_fill(agg)
 
     # ---- Option B: periodic flusher loop (NEW) ----
@@ -418,27 +449,26 @@ class CopyTradingBot:
                 szi = position.get("szi", "0")
                 size = float(szi)
 
-                if size != 0 and coin:
+                if coin and abs(size) > 1e-10:
                     new_positions[coin] = size
                     synced_count += 1
-                    if verbose:
-                        direction = "LONG" if size > 0 else "SHORT"
-                        print(f"   {coin}: {abs(size):.4f} ({direction})")
 
             with self.state_lock:
                 self.open_positions = new_positions
 
             if verbose:
-                print(f"   📊 {synced_count} position(s)\n" if synced_count else "   No positions\n")
+                if synced_count == 0:
+                    print("   No positions")
+                else:
+                    print(f"   Synced {synced_count} positions:")
+                    for coin, sz in new_positions.items():
+                        side = "LONG" if sz > 0 else "SHORT"
+                        print(f"   - {coin}: {abs(sz)} ({side})")
 
         except Exception as e:
-            if verbose:
-                print(f"   ⚠️  Sync failed: {e}\n")
+            print(f"❌ Error syncing positions: {e}")
 
     def _sync_on_miss_for_coin(self, coin: str):
-        if self.dry_run or self.info is None:
-            return
-
         now = time.time()
         with self.state_lock:
             last = self.last_sync_ts.get(coin, 0.0)
@@ -446,195 +476,207 @@ class CopyTradingBot:
                 return
             self.last_sync_ts[coin] = now
 
-        self._sync_positions_from_exchange(verbose=False)
+        try:
+            self._sync_positions_from_exchange(verbose=False)
+        except Exception:
+            pass
 
-    # ------------------------
-    # Pending close processing
-    # ------------------------
     def _process_pending_closes_for_coin(self, coin: str):
-        while True:
-            with self.state_lock:
-                pend = self.pending_closes.get(coin, [])
-                if not pend:
-                    return
-                if coin not in self.open_positions:
-                    return
-                our_pos = float(self.open_positions.get(coin, 0.0))
-                item = pend.pop(0)
-                if pend:
-                    self.pending_closes[coin] = pend
-                else:
-                    self.pending_closes.pop(coin, None)
+        with self.state_lock:
+            closes = list(self.pending_closes.get(coin, []))
+            if not closes:
+                return
+            our_pos = float(self.open_positions.get(coin, 0.0))
+            has_pos = coin in self.open_positions
 
-            frac = float(item.get("frac", 1.0))
-            price = item.get("price", "0")
-            close_side = 'A' if our_pos > 0 else 'B'
+        if (not has_pos) or abs(our_pos) <= 1e-10:
+            return
+
+        self.pending_closes.pop(coin, None)
+
+        for c in closes:
+            frac = float(c.get("frac", 1.0))
+            price = c.get("price", "0")
+            direction = c.get("dir", "")
+            ts_ms = c.get("ts_ms", None)
+
             our_close_sz = self._round_size(coin, abs(our_pos) * frac)
             if our_close_sz <= 0:
                 continue
 
-            print(f"\n   🧩 Pending CLOSE triggered for {coin}: frac={frac:.4f}, close_sz={our_close_sz}")
+            close_side = 'A' if our_pos > 0 else 'B'
+            print("\n" + "=" * 70)
+            tstamp_str = ""
+            if ts_ms is not None:
+                try:
+                    dt = datetime.datetime.fromtimestamp(ts_ms / 1000.0)
+                    tstamp_str = dt.strftime("%H:%M:%S")
+                except Exception:
+                    tstamp_str = ""
+            print(f"📌 {tstamp_str} RETRY CLOSE: {coin} frac={frac:.4f} our_close={our_close_sz} (pos={abs(our_pos):.4f})")
             self.place_order(coin, close_side, our_close_sz, price, is_closing=True)
-
-    # ------------------------
-    # Signals / shutdown
-    # ------------------------
-    def _signal_handler(self, sig, frame):
-        print("\n\n🛑 Shutting down...")
-        try:
-            self._coalesce_flush_all()
-        except Exception:
-            pass
-        self._stop_async_pipeline()
-        print(f"📊 Processed {len(self.processed_fills)} unique target fills")
-        if self.dropped_fills:
-            print(f"⚠️  Dropped target fills due to queue saturation: {self.dropped_fills}")
-        print("\nGoodbye! 👋\n")
-        sys.exit(0)
-
-    # ------------------------
-    # Sizing logic
-    # ------------------------
-    def calculate_position_size(self, target_size, target_price, coin):
-        target_notional_usd = float(target_size) * float(target_price)
-        ratio = self.copy_percentage / 100.0
-        our_value_usd = target_notional_usd * ratio
-
-        if our_value_usd > self.max_position_usd:
-            our_value_usd = self.max_position_usd
-
-        if our_value_usd < self.min_position_usd:
-            print(f"      ⏭️  SKIP: our notional ${our_value_usd:.2f} < min ${self.min_position_usd:.2f}")
-            return None
-
-        our_size_raw = our_value_usd / float(target_price)
-        our_size = self._round_size(coin, our_size_raw)
-
-        if coin in self.coin_metadata:
-            decimals = self.coin_metadata[coin]["szDecimals"]
-            if abs(our_size - our_size_raw) > 0.0001:
-                print(f"      🔧 Rounded: {our_size_raw:.6f} → {our_size} ({decimals} decimals)")
-
-        notional_value = our_size * float(target_price)
-        if notional_value < self.min_notional_usd:
-            print(f"      ⏭️  SKIP: Notional ${notional_value:.2f} < ${self.min_notional_usd} min (exchange rule)")
-            return None
-
-        return our_size
-
-    # ------------------------
-    # Target position reconstruction (for proportional closes)
-    # ------------------------
-    def _update_target_position(self, coin, size, direction):
-        prev = self.target_positions.get(coin, 0.0)
-        sz = float(size)
-
-        new = prev
-        if direction.startswith("Open"):
-            if "Long" in direction:
-                new = prev + sz
-            elif "Short" in direction:
-                new = prev - sz
-        elif direction.startswith("Close"):
-            if "Long" in direction:
-                new = prev - sz
-            elif "Short" in direction:
-                new = prev + sz
-
-        with self.state_lock:
-            self.target_positions[coin] = new
+            print("=" * 70)
 
     # ------------------------
     # Order placement
     # ------------------------
     def place_order(self, coin, side, size, price, is_closing=False):
-        is_buy = (side == 'B')
-        side_name = 'BUY' if is_buy else 'SELL'
-        action = 'CLOSE' if is_closing else 'OPEN'
-        notional = float(size) * float(price)
+        try:
+            size = float(size)
+            price = float(price)
+        except Exception:
+            return
+
+        if size <= 0 or price <= 0:
+            return
+
+        notional = size * price
+        action = "CLOSE" if is_closing else "OPEN"
+        side_name = 'BUY' if side == 'B' else 'SELL'
 
         print(f"\n   📝 {action}: {side_name} {size} {coin} @ ${price} (${notional:.2f})")
 
-        if self.dry_run:
-            print("   🔵 DRY RUN (set DRY_RUN=false to enable real trading)\n")
-            fake_fill = {"coin": coin, "side": side, "sz": float(size)}
-            self._apply_our_fill_to_positions(fake_fill)
-            return
+        # ---- slippage guard ----
+        is_buy = (side == 'B')
+        slippage = self.slippage_tolerance_pct / 100.0
+        if is_buy:
+            worst_px = price * (1.0 + slippage)
+            worst_px = self._round_price_aggressive(coin, worst_px, True)
+            print(f"      💡 Slippage: pay up to ${worst_px} (vs target's ${price})")
+            limit_px = worst_px
+        else:
+            worst_px = price * (1.0 - slippage)
+            worst_px = self._round_price_aggressive(coin, worst_px, False)
+            print(f"      💡 Slippage: accept down to ${worst_px} (vs target's ${price})")
+            limit_px = worst_px
 
-        if is_closing:
-            self._sync_positions_from_exchange(verbose=False)
-            with self.state_lock:
-                _has_pos = coin in self.open_positions
-                our_position = self.open_positions.get(coin, 0.0)
-            if not _has_pos:
-                print(f"      ⏭️  SKIP: no {coin} position found on exchange (may already be closed)")
-                return
-            if abs(our_position) < float(size):
-                print(f"      ⚠️  Adjusting close size to our actual position: {abs(our_position)}")
-                size = abs(our_position)
+        if self.dry_run:
+            print("      🧪 DRY RUN: order not sent")
+            return
 
         try:
-            order_price = float(price)
-
-            if self.slippage_tolerance_pct > 0:
-                if is_buy:
-                    order_price = order_price * (1 + self.slippage_tolerance_pct / 100.0)
-                else:
-                    order_price = order_price * (1 - self.slippage_tolerance_pct / 100.0)
-
-            order_price = self._round_price_aggressive(coin, order_price, is_buy)
-
-            if order_price != float(price):
-                action_txt = "pay up to" if is_buy else "accept down to"
-                print(f"      💡 Slippage: {action_txt} ${order_price} (vs target's ${price})")
-
-            order_result = self.exchange.order(
-                coin,
-                is_buy,
-                size,
-                order_price,
-                {"limit": {"tif": "Ioc"}},
-                reduce_only=is_closing
-            )
-
-            status = order_result.get("status", "")
-            resp = order_result.get("response", {})
-
-            if status != "ok":
-                print(f"      ❌ Order API failed: {resp}")
-                return
-
-            data = resp.get("data", {}) if isinstance(resp, dict) else {}
-            statuses = data.get("statuses", []) if isinstance(data, dict) else []
-
-            if isinstance(statuses, list) and statuses:
-                for st in statuses:
-                    if not isinstance(st, dict):
-                        continue
-                    if "filled" in st:
-                        f = st.get("filled", {})
-                        print(f"      ✅ Order status: filled totalSz={f.get('totalSz')} avgPx={f.get('avgPx')} oid={f.get('oid')}")
-                    elif "resting" in st:
-                        r = st.get("resting", {})
-                        print(f"      🟡 Order status: resting oid={r.get('oid')}")
-                    elif "error" in st:
-                        print(f"      ❌ Order status: error {st.get('error')}")
-                    else:
-                        print(f"      ℹ️ Order status: {st}")
-            else:
-                print("      ℹ️ Order accepted (no detailed status). Waiting for our WS fills to confirm execution.")
-
+            resp = self.exchange.order(coin, is_buy, size, limit_px, {"limit": {"tif": "Ioc"}})
         except Exception as e:
-            print(f"      ❌ Exception: {e}\n")
-
-    # ------------------------
-    # Target fill processing (runs in worker threads)
-    # ------------------------
-    def process_fill(self, wallet_address, fill_data):
-        if wallet_address.lower() != self.target_wallet:
+            print(f"      ❌ Order error: {e}")
             return
 
-        agg_id = fill_data.get("_agg_id")
+        try:
+            status = resp.get("status", "")
+            if status == "ok":
+                r = resp.get("response", {})
+                oid = r.get("oid", None)
+                if "filled" in r:
+                    filled = r["filled"]
+                    print(f"      ✅ Order status: filled totalSz={filled.get('totalSz')} avgPx={filled.get('avgPx')} oid={oid}")
+                elif "resting" in r:
+                    print(f"      ✅ Order status: resting oid={oid}")
+                else:
+                    print(f"      ✅ Order status: ok oid={oid}")
+            else:
+                print(f"      ❌ Order status: {status} {resp}")
+        except Exception:
+            print(f"      ⚠️  Order placed (could not parse status)")
+
+    # ------------------------
+    # Compute our position size (OPEN)
+    # ------------------------
+    def calculate_position_size(self, target_size, target_price, coin):
+        try:
+            target_size = float(target_size)
+            target_price = float(target_price)
+        except Exception:
+            return None
+
+        if target_size <= 0 or target_price <= 0:
+            return None
+
+        target_notional = target_size * target_price
+        our_notional = target_notional * (self.copy_percentage / 100.0)
+
+        if our_notional < self.min_position_usd:
+            print(f"      ⏭️  SKIP: our notional ${our_notional:.2f} < min ${self.min_position_usd:.2f}")
+            return None
+
+        our_notional = min(our_notional, self.max_position_usd)
+        our_size = our_notional / target_price
+        our_size = self._round_size(coin, our_size)
+
+        if our_size <= 0:
+            print("      ⏭️  SKIP: Computed size is 0")
+            return None
+
+        if (our_size * target_price) < self.min_notional_usd:
+            print(f"      ⏭️  SKIP: our notional ${(our_size * target_price):.2f} < min ${self.min_notional_usd:.2f}")
+            return None
+
+        # Print rounding info
+        raw_size = target_size * (self.copy_percentage / 100.0)
+        if abs(raw_size - our_size) > 1e-12:
+            dec = self.coin_metadata.get(coin, {}).get("szDecimals", 0)
+            print(f"      🔧 Rounded: {raw_size:.{dec+6}f} → {our_size} ({dec} decimals)")
+
+        return our_size
+
+    # ------------------------
+    # Target position reconstruction (for close fractions)
+    # ------------------------
+    def _update_target_position(self, coin, size, direction):
+        try:
+            sz = float(size)
+        except Exception:
+            sz = 0.0
+
+        with self.state_lock:
+            prev = float(self.target_positions.get(coin, 0.0))
+
+            if direction.startswith("Open"):
+                # Side is encoded via dir: Long/Short...
+                if "Short" in direction:
+                    new = prev - sz
+                else:
+                    new = prev + sz
+            else:
+                # Close decreases magnitude in direction of position
+                if prev < 0:
+                    new = prev + sz
+                else:
+                    new = prev - sz
+
+            if abs(new) < 1e-10:
+                if coin in self.target_positions:
+                    del self.target_positions[coin]
+            else:
+                self.target_positions[coin] = new
+
+    # ------------------------
+    # Signal handler
+    # ------------------------
+    def _signal_handler(self, sig, frame):
+        print("\n\n🛑 Shutting down...")
+
+        try:
+            self._coalesce_flush_all()
+        except Exception:
+            pass
+
+        self._stop_async_pipeline()
+        self.stop_event.set()
+
+        with self.state_lock:
+            unique = len(self.processed_fills)
+        print(f"📊 Processed {unique} unique target fills")
+
+        sys.exit(0)
+
+    # ------------------------
+    # Main fill processor
+    # ------------------------
+    def process_fill(self, target_user, fill_data):
+        if not isinstance(fill_data, dict):
+            return
+
+        # Use aggregated id if present; else hash_tid
+        agg_id = fill_data.get("_agg_id", None)
         if agg_id:
             fill_id = str(agg_id)
         else:
@@ -730,8 +772,18 @@ class CopyTradingBot:
 
         # ===== CLOSE logic =====
         if is_closing:
-            with self.state_lock:
-                prev_target_pos = self.target_positions.get(coin, 0.0)
+            # Prefer exchange-provided startPosition (position before this fill) for robust close fractions
+            start_pos = fill_data.get("startPosition", None)
+            prev_target_pos = None
+            if start_pos is not None:
+                try:
+                    prev_target_pos = float(start_pos)
+                except Exception:
+                    prev_target_pos = None
+
+            if prev_target_pos is None:
+                with self.state_lock:
+                    prev_target_pos = self.target_positions.get(coin, 0.0)
 
             target_close_sz = float(size)
             frac = (target_close_sz / abs(prev_target_pos)) if abs(prev_target_pos) > 0 else 1.0
@@ -923,6 +975,15 @@ class CopyTradingBot:
                             for fill in fills:
                                 if isinstance(fill, dict):
                                     fill["_recv_ms"] = recv_ms
+                                    # Pre-coalesce dedup (prevents double-counting target_positions on reconnect duplicates)
+                                    rid = self._raw_target_fill_id(fill)
+                                    with self.state_lock:
+                                        if rid in self.raw_target_seen:
+                                            continue
+                                        self.raw_target_seen.add(rid)
+                                        # Avoid unbounded growth (best-effort; does not affect correctness beyond window)
+                                        if len(self.raw_target_seen) > 250000:
+                                            self.raw_target_seen.clear()
                                     self._coalesce_add_fill(fill)
                             continue
 
