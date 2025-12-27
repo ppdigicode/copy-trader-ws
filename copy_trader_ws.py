@@ -36,7 +36,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Hyperliquid Copy Trading Bot v2.10")
+        print("\n🤖 Hyperliquid Copy Trading Bot v2.11")
 
         load_dotenv()
 
@@ -81,6 +81,7 @@ class CopyTradingBot:
         # === State Tracking ===
         self.processed_fills = set()      # Avoid duplicate fills (TARGET only; includes aggregated ids)
         self.open_positions = {}          # {coin: net size} - positive=long, negative=short (OUR ACCOUNT)
+        self.open_positions_est = {}      # {coin: net size} optimistic/estimated (accounts for in-flight orders)
         self.coin_metadata = {}           # Cached size precision per coin
         self.target_positions = {}        # {coin: net size} - target trader reconstructed from fills
 
@@ -416,13 +417,54 @@ class CopyTradingBot:
             else:
                 self.open_positions[coin] = new
 
+            # Keep optimistic estimate aligned with confirmed fills
+            if abs(new) < 1e-10:
+                if coin in self.open_positions_est:
+                    del self.open_positions_est[coin]
+            else:
+                self.open_positions_est[coin] = new
+
             has_pending = bool(self.pending_closes.get(coin))
             has_pos = (coin in self.open_positions)
 
         if has_pending and has_pos:
             self._trigger_pending_close_processing(coin)
 
-    # ------------------------
+    
+    def _get_our_position_estimated(self, coin: str) -> float:
+        """Return our *estimated* position for sizing decisions (includes in-flight orders)."""
+        with self.state_lock:
+            if coin in self.open_positions_est:
+                return float(self.open_positions_est.get(coin, 0.0))
+            return float(self.open_positions.get(coin, 0.0))
+
+    def _apply_order_to_estimated_position(self, coin: str, side: str, size: float, is_closing: bool):
+        """Optimistically apply an accepted order to our estimated position."""
+        try:
+            sz = float(size)
+        except Exception:
+            return
+        if sz <= 0:
+            return
+        delta = sz if side == "B" else -sz
+
+        with self.state_lock:
+            prev = float(self.open_positions_est.get(coin, self.open_positions.get(coin, 0.0) or 0.0))
+            new = prev + delta
+
+            # If this is a reduce-only close, never let the estimate flip sign past zero.
+            if is_closing:
+                if prev > 0 and new < 0:
+                    new = 0.0
+                elif prev < 0 and new > 0:
+                    new = 0.0
+
+            if abs(new) < 1e-10:
+                self.open_positions_est.pop(coin, None)
+            else:
+                self.open_positions_est[coin] = new
+
+# ------------------------
     # Exchange sync (fallback / debug)
     # ------------------------
     def _sync_positions_from_exchange(self, verbose=True):
@@ -451,6 +493,8 @@ class CopyTradingBot:
 
             with self.state_lock:
                 self.open_positions = new_positions
+                # Keep estimated positions in sync with real positions when we have an authoritative snapshot
+                self.open_positions_est = dict(new_positions)
 
             if verbose:
                 print(f"   📊 {synced_count} position(s)\n" if synced_count else "   No positions\n")
@@ -597,7 +641,7 @@ class CopyTradingBot:
                     return
                 if coin not in self.open_positions:
                     return
-                our_pos = float(self.open_positions.get(coin, 0.0))
+                our_pos = float(self.open_positions_est.get(coin, self.open_positions.get(coin, 0.0)))
                 item = pend.pop(0)
                 if pend:
                     self.pending_closes[coin] = pend
@@ -606,8 +650,9 @@ class CopyTradingBot:
 
             frac = float(item.get("frac", 1.0))
             price = item.get("price", "0")
-            close_side = 'A' if our_pos > 0 else 'B'
-            our_close_sz = self._round_size(coin, abs(our_pos) * frac)
+            close_side = 'A' if our_pos_est > 0 else 'B'
+            our_pos_est = self._get_our_position_estimated(coin)
+            our_close_sz = self._round_size(coin, abs(our_pos_est) * frac)
             if our_close_sz <= 0:
                 continue
 
@@ -745,6 +790,7 @@ class CopyTradingBot:
             data = resp.get("data", {}) if isinstance(resp, dict) else {}
             statuses = data.get("statuses", []) if isinstance(data, dict) else []
 
+            had_error = False
             if isinstance(statuses, list) and statuses:
                 for st in statuses:
                     if not isinstance(st, dict):
@@ -756,11 +802,16 @@ class CopyTradingBot:
                         r = st.get("resting", {})
                         print(f"      🟡 Order status: resting oid={r.get('oid')}")
                     elif "error" in st:
+                        had_error = True
                         print(f"      ❌ Order status: error {st.get('error')}")
                     else:
                         print(f"      ℹ️ Order status: {st}")
             else:
                 print("      ℹ️ Order accepted (no detailed status). Waiting for our WS fills to confirm execution.")
+
+            # Optimistically adjust our estimated position so bursty CLOSE events size correctly
+            if not had_error:
+                self._apply_order_to_estimated_position(coin, side, size, is_closing)
 
         except Exception as e:
             print(f"      ❌ Exception: {e}\n")
@@ -876,7 +927,7 @@ class CopyTradingBot:
 
             with self.state_lock:
                 has_pos = (coin in self.open_positions)
-                our_pos = float(self.open_positions.get(coin, 0.0))
+                our_pos = float(self.open_positions_est.get(coin, self.open_positions.get(coin, 0.0)))
 
             if not has_pos:
                 self._sync_on_miss_for_coin(coin)
@@ -900,16 +951,17 @@ class CopyTradingBot:
 
                 our_pos = our_pos2
 
-            our_close_sz = self._round_size(coin, abs(our_pos) * frac)
+            our_pos_est = self._get_our_position_estimated(coin)
+            our_close_sz = self._round_size(coin, abs(our_pos_est) * frac)
             if our_close_sz <= 0:
                 print("   ⏭️  SKIP: Computed close size is 0")
                 print("=" * 70)
                 self._update_target_position(coin, size, direction)
                 return
 
-            close_side = 'A' if our_pos > 0 else 'B'
+            close_side = 'A' if our_pos_est > 0 else 'B'
             print(f"   📉 Target close fraction: {frac:.4f} of their position")
-            print(f"   📉 Our close: {our_close_sz} (from our pos {abs(our_pos):.4f})")
+            print(f"   📉 Our close: {our_close_sz} (from our pos {abs(our_pos_est):.4f})")
 
             self._update_target_position(coin, size, direction)
             self.place_order(coin, close_side, our_close_sz, price, is_closing=True)
