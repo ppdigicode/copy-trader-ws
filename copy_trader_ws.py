@@ -36,7 +36,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Hyperliquid Copy Trading Bot v2.11")
+        print("\n🤖 Hyperliquid Copy Trading Bot v2.12")
 
         load_dotenv()
 
@@ -464,10 +464,23 @@ class CopyTradingBot:
             else:
                 self.open_positions_est[coin] = new
 
+    def _set_our_position_estimated(self, coin: str, value: float):
+        """Set our estimated position for a coin explicitly (internal helper)."""
+        with self.state_lock:
+            try:
+                v = float(value)
+            except Exception:
+                v = 0.0
+            if abs(v) < 1e-10:
+                self.open_positions_est.pop(coin, None)
+            else:
+                self.open_positions_est[coin] = v
+
+
 # ------------------------
     # Exchange sync (fallback / debug)
     # ------------------------
-    def _sync_positions_from_exchange(self, verbose=True):
+    def _sync_positions_from_exchange(self, verbose=True, update_estimated=True):
         try:
             if verbose:
                 print("🔄 Syncing positions...")
@@ -493,8 +506,9 @@ class CopyTradingBot:
 
             with self.state_lock:
                 self.open_positions = new_positions
-                # Keep estimated positions in sync with real positions when we have an authoritative snapshot
-                self.open_positions_est = dict(new_positions)
+                # Optionally keep estimated positions in sync with real positions (can be disabled to preserve in-flight estimates)
+                if update_estimated:
+                    self.open_positions_est = dict(new_positions)
 
             if verbose:
                 print(f"   📊 {synced_count} position(s)\n" if synced_count else "   No positions\n")
@@ -607,7 +621,7 @@ class CopyTradingBot:
         time.sleep(0.2)
         while not self.stop_event.is_set():
             try:
-                self._sync_positions_from_exchange(verbose=False)
+                self._sync_positions_from_exchange(verbose=False, update_estimated=False)
                 self._reconcile_orphan_positions()
             except Exception:
                 pass
@@ -650,8 +664,8 @@ class CopyTradingBot:
 
             frac = float(item.get("frac", 1.0))
             price = item.get("price", "0")
-            close_side = 'A' if our_pos_est > 0 else 'B'
             our_pos_est = self._get_our_position_estimated(coin)
+            close_side = 'A' if our_pos_est > 0 else 'B'
             our_close_sz = self._round_size(coin, abs(our_pos_est) * frac)
             if our_close_sz <= 0:
                 continue
@@ -745,7 +759,7 @@ class CopyTradingBot:
             return
 
         if is_closing:
-            self._sync_positions_from_exchange(verbose=False)
+            self._sync_positions_from_exchange(verbose=False, update_estimated=False)
             with self.state_lock:
                 _has_pos = coin in self.open_positions
                 our_position = self.open_positions.get(coin, 0.0)
@@ -771,6 +785,11 @@ class CopyTradingBot:
                 action_txt = "pay up to" if is_buy else "accept down to"
                 print(f"      💡 Slippage: {action_txt} ${order_price} (vs target's ${price})")
 
+            # Optimistically adjust our estimated position *before* the blocking order call,
+            # so bursty CLOSE events size against an in-flight-adjusted estimate.
+            prev_est = self._get_our_position_estimated(coin)
+            self._apply_order_to_estimated_position(coin, side, size, is_closing)
+
             order_result = self.exchange.order(
                 coin,
                 is_buy,
@@ -785,6 +804,8 @@ class CopyTradingBot:
 
             if status != "ok":
                 print(f"      ❌ Order API failed: {resp}")
+                # rollback optimistic estimate
+                self._set_our_position_estimated(coin, prev_est)
                 return
 
             data = resp.get("data", {}) if isinstance(resp, dict) else {}
@@ -809,11 +830,16 @@ class CopyTradingBot:
             else:
                 print("      ℹ️ Order accepted (no detailed status). Waiting for our WS fills to confirm execution.")
 
-            # Optimistically adjust our estimated position so bursty CLOSE events size correctly
-            if not had_error:
-                self._apply_order_to_estimated_position(coin, side, size, is_closing)
+            # If order returned an error status, rollback optimistic estimate
+            if had_error:
+                self._set_our_position_estimated(coin, prev_est)
 
         except Exception as e:
+            # rollback optimistic estimate on exception
+            try:
+                self._set_our_position_estimated(coin, prev_est)
+            except Exception:
+                pass
             print(f"      ❌ Exception: {e}\n")
 
     # ------------------------
@@ -991,7 +1017,7 @@ class CopyTradingBot:
             return
 
         try:
-            self._sync_positions_from_exchange(verbose=False)
+            self._sync_positions_from_exchange(verbose=False, update_estimated=False)
             with self.state_lock:
                 positions = dict(self.open_positions)
 
